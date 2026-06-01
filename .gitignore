@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# pdf2png 测试/转换产物
+*.zip
+test_*.pdf

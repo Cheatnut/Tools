@@ -2,16 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 pdf2png - 轻量化 PDF 转 PNG 工具
-将 PDF 文件的每一页渲染为 PNG 图片，可选打包为 ZIP 文件，支持批量处理。
+将 PDF 文件的每一页渲染为 PNG 图片，可选打包为 ZIP 文件或合并为长图，支持批量处理。
 
-用法: pdf2png [-z] <pdf_file> [pdf_file2 ...] [save_path]
+用法: pdf2png [-z] [-l [N]] <pdf_file> [pdf_file2 ...] [save_path]
 
 选项:
-  -z    将 PNG 图片打包为 <pdf文件名>.zip（默认不打包）
+  -z         将 PNG 图片打包为 <pdf文件名>.zip（默认不打包）
+  -l [N]     将每 N 页纵向合并为一张长图，N 范围 1-4（默认 4）
+             不足 N 页的尾部合并为一张
 
 输出:
-  默认:  在目标路径下创建 <pdf文件名>/ 文件夹，内含 <pdf文件名>_1.png, <pdf文件名>_2.png, ...
-  -z 模式: 打包为 <pdf文件名>.zip，中间 PNG 自动清理
+  默认:      在目标路径下创建 <pdf文件名>/ 文件夹，内含 <pdf文件名>_1.png, ...
+  -l 模式:   合并长图，命名为 <pdf文件名>_1-4.png, <pdf文件名>_5-8.png, ...
+  -z 模式:   打包为 <pdf文件名>.zip，中间 PNG 自动清理
 """
 
 import glob
@@ -33,7 +36,8 @@ from PIL import Image
 from tqdm import tqdm
 
 # ---- 常量 ----
-RENDER_DPI = 200  # 渲染分辨率（每英寸像素数），平衡清晰度和文件大小
+RENDER_DPI = 200           # 渲染分辨率（每英寸像素数），平衡清晰度和文件大小
+DEFAULT_MERGE_COUNT = 4    # -l 默认每组合并页数
 
 
 def validate_pdf(pdf_path: str) -> fitz.Document | None:
@@ -56,47 +60,79 @@ def validate_pdf(pdf_path: str) -> fitz.Document | None:
     return doc
 
 
-def render_page_to_png(doc: fitz.Document, page_index: int, output_dir: str, basename: str) -> str:
-    """渲染 PDF 的某一页为 PNG 图片。
+def pixmap_to_pil(pix: fitz.Pixmap) -> Image.Image:
+    """将 fitz.Pixmap 转换为 PIL Image，自动处理色彩空间。
 
-    Args:
-        doc: fitz.Document 对象
-        page_index: 页面索引（0 起始，内部使用）
-        output_dir: 输出目录路径
-        basename: PDF 文件基本名（用于生成 PNG 文件名）
-
-    Returns:
-        生成的 PNG 文件的完整路径
-
-    命名规则: <basename>_<page_index + 1>.png（页码 1 起始，便于用户阅读）
+    支持的色彩空间：RGB、RGBA、CMYK（自动转 sRGB）、灰度。
     """
-    page = doc[page_index]
-    page_num = page_index + 1  # 用户可见的页码，从 1 开始
-    png_name = f"{basename}_{page_num}.png"
-    png_path = os.path.join(output_dir, png_name)
-
-    # 将页面渲染为 pixmap（默认 RGB 色彩空间）
-    pix = page.get_pixmap(dpi=RENDER_DPI)
-
-    # 处理不同色彩空间
+    # CMYK 需先转换为 sRGB
     if pix.n == 4 and not pix.alpha:
-        # CMYK 色彩空间，需先转换为 sRGB
         pix = fitz.Pixmap(fitz.csRGB, pix)
 
     # 根据通道数确定 PIL 图像模式
     if pix.n == 4:
-        mode = "RGBA"  # 有 alpha 通道
+        mode = "RGBA"
     elif pix.n == 3:
         mode = "RGB"
     elif pix.n == 1:
         mode = "L"  # 灰度
     else:
-        mode = "RGB"  # 未知色彩空间，默认按 RGB 处理
+        mode = "RGB"
 
-    img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+    return Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+
+
+def render_page_to_pil(doc: fitz.Document, page_index: int) -> Image.Image:
+    """渲染 PDF 某一页为 PIL Image 对象（不写入磁盘）。"""
+    page = doc[page_index]
+    pix = page.get_pixmap(dpi=RENDER_DPI)
+    return pixmap_to_pil(pix)
+
+
+def render_page_to_png(doc: fitz.Document, page_index: int, output_dir: str, basename: str) -> str:
+    """渲染 PDF 的某一页并保存为 PNG 文件。
+
+    Returns:
+        生成的 PNG 文件的完整路径
+
+    命名规则: <basename>_<page_index + 1>.png（页码 1 起始）
+    """
+    page_num = page_index + 1
+    png_name = f"{basename}_{page_num}.png"
+    png_path = os.path.join(output_dir, png_name)
+
+    img = render_page_to_pil(doc, page_index)
     img.save(png_path, "PNG")
-
     return png_path
+
+
+def merge_images_vertical(images: list[Image.Image]) -> Image.Image:
+    """将多张 PIL Image 纵向拼接为一张长图。
+
+    以最大宽度为画布宽度，每张图片水平居中；
+    背景用白色填充，处理不同色彩模式（RGBA→RGB）。
+
+    Returns:
+        拼接后的 PIL Image（RGB 模式）
+    """
+    if not images:
+        raise ValueError("图片列表不能为空")
+
+    max_width = max(img.width for img in images)
+    total_height = sum(img.height for img in images)
+
+    canvas = Image.new("RGB", (max_width, total_height), (255, 255, 255))
+
+    y_offset = 0
+    for img in images:
+        # 统一转为 RGB 后再粘贴
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        x_offset = (max_width - img.width) // 2
+        canvas.paste(img, (x_offset, y_offset))
+        y_offset += img.height
+
+    return canvas
 
 
 def zip_pngs(png_dir: str, zip_path: str) -> bool:
@@ -114,13 +150,21 @@ def zip_pngs(png_dir: str, zip_path: str) -> bool:
         return False
 
 
-def convert_one(pdf_path: str, save_dir: str, do_zip: bool, file_index: int = 0, total_files: int = 1) -> tuple[bool, str]:
+def convert_one(
+    pdf_path: str,
+    save_dir: str,
+    do_zip: bool,
+    merge_count: int = 0,
+    file_index: int = 0,
+    total_files: int = 1,
+) -> tuple[bool, str]:
     """转换单个 PDF 文件。
 
     Args:
         pdf_path: PDF 文件路径
         save_dir: 输出目录
         do_zip: 是否打包为 ZIP
+        merge_count: 每组合并页数，0 或 1 表示不合并不合并（逐页输出）
         file_index: 当前文件序号（1 起始，用于批量显示）
         total_files: 文件总数
 
@@ -139,10 +183,11 @@ def convert_one(pdf_path: str, save_dir: str, do_zip: bool, file_index: int = 0,
 
     doc = validate_pdf(pdf_path)
     if doc is None:
-        return (False, f"无法打开文件")
+        return (False, "无法打开文件")
 
     basename = Path(pdf_path).stem
     page_count = len(doc)
+    do_merge = merge_count > 1  # 是否启用长图合并模式
 
     # 确保输出目录可写
     try:
@@ -150,9 +195,9 @@ def convert_one(pdf_path: str, save_dir: str, do_zip: bool, file_index: int = 0,
     except OSError as e:
         doc.close()
         print(f"  错误：无法创建输出目录 {save_dir} ({e})", file=sys.stderr)
-        return (False, f"无法创建输出目录")
+        return (False, "无法创建输出目录")
 
-    # 根据是否打包决定输出目录：打包用临时目录，不打包则在 save_dir 下建立同名文件夹
+    # 根据是否打包决定输出目录
     if do_zip:
         png_output_dir = tempfile.mkdtemp(prefix="pdf2png_")
     else:
@@ -162,33 +207,71 @@ def convert_one(pdf_path: str, save_dir: str, do_zip: bool, file_index: int = 0,
         except OSError as e:
             doc.close()
             print(f"  错误：无法创建输出目录 {png_output_dir} ({e})", file=sys.stderr)
-            return (False, f"无法创建输出目录")
+            return (False, "无法创建输出目录")
 
-    output_path = ""  # 最终输出路径，用于完成提示
+    output_path = ""
     success = True
+    failed_page = 0
 
     try:
-        # 逐页渲染 PNG，显示进度条
         with tqdm(
             total=page_count,
-            desc=f"  渲染页面",
+            desc="  渲染页面",
             unit="页",
             ncols=80,
             ascii=False,
             file=sys.stdout,
             bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} 页 [{elapsed}<{remaining}]",
         ) as pbar:
-            for i in range(page_count):
-                try:
-                    render_page_to_png(doc, i, png_output_dir, basename)
-                except Exception as e:
-                    print(f"\n  错误：无法渲染第 {i + 1} 页 ({e})", file=sys.stderr)
-                    success = False
-                    break
-                pbar.update(1)
+
+            if do_merge:
+                # ---- 长图合并模式 ----
+                group: list[Image.Image] = []  # 当前组内页面的 PIL Image
+                group_start_idx = 0            # 当前组的起始页索引（0 起始）
+
+                for i in range(page_count):
+                    try:
+                        img = render_page_to_pil(doc, i)
+                    except Exception as e:
+                        failed_page = i + 1
+                        print(f"\n  错误：无法渲染第 {failed_page} 页 ({e})", file=sys.stderr)
+                        success = False
+                        break
+                    group.append(img)
+
+                    # 凑满一组或到达最后一页时，合并并写出
+                    if len(group) == merge_count or i == page_count - 1:
+                        start_page = group_start_idx + 1  # 1 起始
+                        end_page = i + 1
+                        # 文件名：单页用 "_N.png"，多页用 "_N-M.png"
+                        if start_page == end_page:
+                            png_name = f"{basename}_{start_page}.png"
+                        else:
+                            png_name = f"{basename}_{start_page}-{end_page}.png"
+                        png_path = os.path.join(png_output_dir, png_name)
+
+                        merged = merge_images_vertical(group)
+                        merged.save(png_path, "PNG")
+
+                        group = []
+                        group_start_idx = i + 1
+
+                    pbar.update(1)
+
+            else:
+                # ---- 逐页模式 ----
+                for i in range(page_count):
+                    try:
+                        render_page_to_png(doc, i, png_output_dir, basename)
+                    except Exception as e:
+                        failed_page = i + 1
+                        print(f"\n  错误：无法渲染第 {failed_page} 页 ({e})", file=sys.stderr)
+                        success = False
+                        break
+                    pbar.update(1)
 
         if not success:
-            return (False, f"渲染第 {i + 1} 页时失败")
+            return (False, f"渲染第 {failed_page} 页时失败")
 
         # 如果指定了 -z，打包为 ZIP
         if do_zip:
@@ -202,12 +285,10 @@ def convert_one(pdf_path: str, save_dir: str, do_zip: bool, file_index: int = 0,
             output_path = png_output_dir
 
     finally:
-        # 清理资源
         doc.close()
         if do_zip:
             shutil.rmtree(png_output_dir, ignore_errors=True)
 
-    # 完成提示
     print(f"  ✓ 转换完成 → {output_path}")
     return (True, output_path)
 
@@ -236,19 +317,35 @@ def expand_globs(args: list[str]) -> list[str]:
     return result
 
 
-def parse_args(argv: list[str]) -> tuple[bool, list[str], str]:
+def parse_args(argv: list[str]) -> tuple[bool, int, list[str], str]:
     """解析命令行参数，支持通配符展开。
 
     Returns:
-        (do_zip, pdf_files, save_dir)
+        (do_zip, merge_count, pdf_files, save_dir)
     """
     do_zip = False
     if "-z" in argv:
         do_zip = True
         argv.remove("-z")
 
+    # 解析 -l [N]（N 范围 1-4，省略时默认 4）
+    merge_count = 0
+    if "-l" in argv:
+        idx = argv.index("-l")
+        argv.pop(idx)
+        # 尝试读取紧跟的数字
+        if idx < len(argv) and argv[idx].isdigit():
+            n = int(argv.pop(idx))
+            if 1 <= n <= 4:
+                merge_count = n
+            else:
+                print("错误：-l 参数值必须为 1-4", file=sys.stderr)
+                sys.exit(1)
+        else:
+            merge_count = DEFAULT_MERGE_COUNT
+
     if len(argv) < 1:
-        print("用法: pdf2png [-z] <pdf_file> [pdf_file2 ...] [save_path]", file=sys.stderr)
+        print("用法: pdf2png [-z] [-l [N]] <pdf_file> [pdf_file2 ...] [save_path]", file=sys.stderr)
         sys.exit(1)
 
     # 先在原始参数中识别 save_dir（通配符展开之前），避免展开后误判
@@ -280,17 +377,21 @@ def parse_args(argv: list[str]) -> tuple[bool, list[str], str]:
         print("用法: pdf2png [-z] <pdf_file> [pdf_file2 ...] [save_path]", file=sys.stderr)
         sys.exit(1)
 
-    return do_zip, pdf_args, save_dir
+    return do_zip, merge_count, pdf_args, save_dir
 
 
 def main():
-    do_zip, pdf_files, save_dir = parse_args(sys.argv[1:])
+    do_zip, merge_count, pdf_files, save_dir = parse_args(sys.argv[1:])
     total = len(pdf_files)
 
     results: list[tuple[str, bool, str]] = []  # (文件名, 成功, 输出路径/错误)
 
     for idx, pdf_path in enumerate(pdf_files, start=1):
-        ok, output = convert_one(pdf_path, save_dir, do_zip, file_index=idx, total_files=total)
+        ok, output = convert_one(
+            pdf_path, save_dir, do_zip,
+            merge_count=merge_count,
+            file_index=idx, total_files=total,
+        )
         results.append((os.path.basename(pdf_path), ok, output))
 
     # 批量模式（多于 1 个文件）时输出汇总
