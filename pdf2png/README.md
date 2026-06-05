@@ -64,7 +64,7 @@ pdf2png ./*.pdf D:\output
 - tqdm — 进度条
 
 ```powershell
-pip install PyMuPDF Pillow tqdm
+pip install -r ..\requirements.txt
 ```
 
 ## 项目结构
